@@ -14,5 +14,3 @@ Requires GTK 3, gtk-layer-shell, and PipeWire.
 cargo build --release
 ./target/release/hyprisland
 ```
-
-The original Python implementation is kept in `dynamic_island.py` for reference.
