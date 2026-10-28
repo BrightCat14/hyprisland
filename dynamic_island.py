@@ -65,16 +65,51 @@ try:
         IFACE = "org.kde.StatusNotifierWatcher"
         PROPS_IFACE = "org.freedesktop.DBus.Properties"
 
-        def __init__(self, bus):
+        def __init__(self, bus, on_register=None):
             self._bus = bus
             self._bus_name = dbus.service.BusName(self.BUS_NAME, bus)
             dbus.service.Object.__init__(self, self._bus_name, self.OBJECT_PATH)
             self._items = []
             self._hosts = []
+            self._on_register = on_register
+
+        def _resolve(self, service, sender):
+            """Return (bus_name, path) for a registration argument."""
+            service = str(service or "")
+            sender = str(sender or "")
+            if service.startswith("/"):
+                # Path-only registration: the sender owns the item.
+                return sender, service
+            if "/" in service:
+                name, rest = service.split("/", 1)
+                return name, "/" + rest
+            return service, "/StatusNotifierItem"
+
+        def add_item(self, name, path):
+            if not name:
+                return
+            entry = (name, path)
+            if entry not in self._items:
+                self._items.append(entry)
+                self.StatusNotifierItemRegistered(name + path)
+                self.PropertiesChanged(
+                    self.IFACE,
+                    {
+                        "RegisteredStatusNotifierItems": dbus.Array(
+                            [n + p for n, p in self._items], signature="s"
+                        )
+                    },
+                    [],
+                )
+                if self._on_register:
+                    try:
+                        self._on_register(name, path)
+                    except Exception:
+                        pass
 
         @dbus.service.method(IFACE, in_signature="", out_signature="as")
         def RegisteredStatusNotifierItems(self):
-            return self._items
+            return [n + p for n, p in self._items]
 
         @dbus.service.method(IFACE, in_signature="", out_signature="b")
         def IsStatusNotifierHostRegistered(self):
@@ -84,20 +119,12 @@ try:
         def ProtocolVersion(self):
             return 0
 
-        @dbus.service.method(IFACE, in_signature="s", out_signature="")
-        def RegisterStatusNotifierItem(self, service):
-            if service and service not in self._items:
-                self._items.append(service)
-                self.StatusNotifierItemRegistered(service)
-                self.PropertiesChanged(
-                    self.IFACE,
-                    {
-                        "RegisteredStatusNotifierItems": dbus.Array(
-                            self._items, signature="s"
-                        )
-                    },
-                    [],
-                )
+        @dbus.service.method(
+            IFACE, in_signature="s", out_signature="", sender_keyword="sender"
+        )
+        def RegisterStatusNotifierItem(self, service, sender=None):
+            name, path = self._resolve(service, sender)
+            self.add_item(name, path)
 
         @dbus.service.method(IFACE, in_signature="s", out_signature="")
         def RegisterStatusNotifierHost(self, service):
@@ -108,7 +135,9 @@ try:
         def Get(self, interface_name, property_name):
             if interface_name == self.IFACE:
                 if property_name == "RegisteredStatusNotifierItems":
-                    return dbus.Array(self._items, signature="s")
+                    return dbus.Array(
+                        [n + p for n, p in self._items], signature="s"
+                    )
                 elif property_name == "IsStatusNotifierHostRegistered":
                     return dbus.Boolean(True)
                 elif property_name == "ProtocolVersion":
@@ -120,7 +149,7 @@ try:
             if interface_name == self.IFACE:
                 return {
                     "RegisteredStatusNotifierItems": dbus.Array(
-                        self._items, signature="s"
+                        [n + p for n, p in self._items], signature="s"
                     ),
                     "IsStatusNotifierHostRegistered": dbus.Boolean(True),
                     "ProtocolVersion": dbus.Int32(0),
@@ -145,6 +174,42 @@ except Exception:
     class SNIWatcher:
         def __init__(self, *args, **kwargs):
             pass
+
+
+class AppIndicatorRegistrar(dbus.service.Object):
+    BUS_NAME = "com.canonical.AppIndicator.Registrar"
+    OBJECT_PATH = "/com/canonical/AppIndicator/Registrar"
+    IFACE = "com.canonical.AppIndicator.Registrar"
+
+    def __init__(self, bus):
+        self._bus = bus
+        self._bus_name = dbus.service.BusName(self.BUS_NAME, bus)
+        dbus.service.Object.__init__(self, self._bus_name, self.OBJECT_PATH)
+        self._apps = []
+
+    @dbus.service.method(IFACE, in_signature="", out_signature="as")
+    def GetApplications(self):
+        return self._apps
+
+    @dbus.service.method(IFACE, in_signature="s", out_signature="")
+    def RegisterApplication(self, service):
+        if service and service not in self._apps:
+            self._apps.append(service)
+            self.ApplicationAdded(service)
+
+    @dbus.service.method(IFACE, in_signature="s", out_signature="")
+    def UnregisterApplication(self, service):
+        if service in self._apps:
+            self._apps.remove(service)
+            self.ApplicationRemoved(service)
+
+    @dbus.service.signal(IFACE, signature="s")
+    def ApplicationAdded(self, service):
+        pass
+
+    @dbus.service.signal(IFACE, signature="s")
+    def ApplicationRemoved(self, service):
+        pass
 
 
 # Layout
@@ -902,7 +967,7 @@ class AudioVisualizer:
         while self.running:
             # Find/refresh stream
             stream_info = self._find_stream()
-            if stream_info is None:
+            if stream_info is None or stream_info[0] is None:
                 # No stream found - publish muted levels
                 self.on_levels(np.zeros(self.analyzer.bands, dtype=np.float32), False)
                 time.sleep(1)
@@ -934,13 +999,19 @@ class AudioVisualizer:
                 pending = b""
 
             # Read audio frame
+            capture = self._capture
+            if capture is None or getattr(capture, "stream", None) is None:
+                self._target_serial = None
+                time.sleep(0.2)
+                continue
             frame_bytes = self.analyzer.chunk * 2
-            raw = pending + self._capture.stream.read(frame_bytes - len(pending))
+            raw = pending + capture.stream.read(frame_bytes - len(pending))
             pending = b""
             if len(raw) < self.analyzer.chunk * 2:
                 # EOF - stream ended
-                self._capture.close()
-                self._capture = None
+                capture.close()
+                if self._capture is capture:
+                    self._capture = None
                 self._target_serial = None
                 self.on_levels(np.zeros(self.analyzer.bands, dtype=np.float32), False)
                 time.sleep(0.5)
@@ -1046,66 +1117,327 @@ class TrayItem:
         self.menu = None
 
 
+class GioSNIWatcher:
+    """StatusNotifierWatcher exported on the shared Gio connection.
+
+    Hosting the watcher on the same connection used for item proxies matters:
+    snap packages (e.g. Telegram) only allow D-Bus traffic from the connection
+    that owns org.kde.StatusNotifierWatcher.
+    """
+
+    BUS_NAME = "org.kde.StatusNotifierWatcher"
+    OBJECT_PATH = "/StatusNotifierWatcher"
+    IFACE = "org.kde.StatusNotifierWatcher"
+
+    XML = """
+    <node>
+      <interface name="org.kde.StatusNotifierWatcher">
+        <method name="RegisterStatusNotifierItem">
+          <arg name="service" type="s" direction="in"/>
+        </method>
+        <method name="RegisterStatusNotifierHost">
+          <arg name="service" type="s" direction="in"/>
+        </method>
+        <property name="RegisteredStatusNotifierItems" type="as" access="read"/>
+        <property name="IsStatusNotifierHostRegistered" type="b" access="read"/>
+        <property name="ProtocolVersion" type="i" access="read"/>
+        <signal name="StatusNotifierItemRegistered">
+          <arg name="service" type="s"/>
+        </signal>
+        <signal name="StatusNotifierItemUnregistered">
+          <arg name="service" type="s"/>
+        </signal>
+      </interface>
+    </node>
+    """
+
+    def __init__(self, connection, on_register):
+        self.conn = connection
+        self.on_register = on_register
+        self.items = []
+        self.hosts = []
+        node = Gio.DBusNodeInfo.new_for_xml(self.XML)
+        self._iface_info = node.lookup_interface(self.IFACE)
+        self._reg_id = connection.register_object(
+            self.OBJECT_PATH,
+            self._iface_info,
+            self._on_method_call,
+            self._on_get_property,
+            None,
+        )
+        self._owner_id = Gio.bus_own_name_on_connection(
+            connection,
+            self.BUS_NAME,
+            Gio.BusNameOwnerFlags.NONE,
+            None,
+            None,
+        )
+
+    def _resolve(self, service, sender):
+        service = str(service or "")
+        sender = str(sender or "")
+        if service.startswith("/"):
+            return sender, service
+        if "/" in service:
+            name, rest = service.split("/", 1)
+            return name, "/" + rest
+        return service, "/StatusNotifierItem"
+
+    def add_item(self, name, path):
+        if not name:
+            return
+        if not self._has_owner(name):
+            return
+        entry = (name, path)
+        if entry in self.items:
+            return
+        self.items.append(entry)
+        self._emit_registered(name + path)
+        self._emit_props()
+        if self.on_register:
+            try:
+                self.on_register(name, path)
+            except Exception:
+                pass
+
+    def _has_owner(self, name):
+        try:
+            reply = self.conn.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                GLib.Variant("(s)", (name,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                300,
+                None,
+            )
+            return bool(reply.unpack()[0])
+        except Exception:
+            return True
+
+    def remove_owner(self, name):
+        before = list(self.items)
+        self.items = [(n, p) for (n, p) in before if n != name]
+        if len(self.items) == len(before):
+            return
+        self._emit_props()
+        for n, p in before:
+            if n == name:
+                try:
+                    self.conn.emit_signal(
+                        None,
+                        self.OBJECT_PATH,
+                        self.IFACE,
+                        "StatusNotifierItemUnregistered",
+                        GLib.Variant("(s)", (n + p,)),
+                    )
+                except Exception:
+                    pass
+
+    def _emit_registered(self, ident):
+        try:
+            self.conn.emit_signal(
+                None,
+                self.OBJECT_PATH,
+                self.IFACE,
+                "StatusNotifierItemRegistered",
+                GLib.Variant("(s)", (ident,)),
+            )
+        except Exception:
+            pass
+
+    def _emit_props(self):
+        try:
+            changed = {
+                "RegisteredStatusNotifierItems": GLib.Variant(
+                    "as", [n + p for n, p in self.items]
+                )
+            }
+            self.conn.emit_signal(
+                None,
+                self.OBJECT_PATH,
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                GLib.Variant("(sa{sv}as)", (self.IFACE, changed, [])),
+            )
+        except Exception:
+            pass
+
+    def _on_method_call(self, conn, sender, path, iface, method, params, invocation):
+        if method == "RegisterStatusNotifierItem":
+            service = params.unpack()[0]
+            name, item_path = self._resolve(service, sender)
+            # Reply before touching the item: it may be blocked waiting for
+            # this reply before it can answer property queries.
+            invocation.return_value(None)
+            GLib.idle_add(self.add_item, name, item_path)
+        elif method == "RegisterStatusNotifierHost":
+            service = str(params.unpack()[0])
+            if service and service not in self.hosts:
+                self.hosts.append(service)
+            invocation.return_value(None)
+        else:
+            invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.UnknownMethod", method
+            )
+
+    def _on_get_property(self, conn, sender, path, iface, prop):
+        if prop == "RegisteredStatusNotifierItems":
+            return GLib.Variant("as", [n + p for n, p in self.items])
+        if prop == "IsStatusNotifierHostRegistered":
+            return GLib.Variant("b", True)
+        if prop == "ProtocolVersion":
+            return GLib.Variant("i", 0)
+        return None
+
+
 class TrayHost:
     WATCHER = "org.kde.StatusNotifierWatcher"
     WATCHER_PATH = "/StatusNotifierWatcher"
     WATCHER_IFACE = "org.kde.StatusNotifierWatcher"
-    ITEM_IFACE = "org.kde.StatusNotifierItem"
+    KDE_ITEM_IFACE = "org.kde.StatusNotifierItem"
+    AYATANA_IFACE = "com.canonical.indicator.application"
+    AYATANA_PATH = "/com/canonical/indicator/application"
+    APPI_REGISTRAR = "com.canonical.AppIndicator.Registrar"
+    APPI_REGISTRAR_PATH = "/com/canonical/AppIndicator/Registrar"
+    APPI_REGISTRAR_IFACE = "com.canonical.AppIndicator.Registrar"
 
     def __init__(self, on_change):
         self.on_change = on_change
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         self.watcher = None
         self._using_own_watcher = False
+        self._appi_registrar = None
         self._by_id = {}
+        self._pending = set()
         self.items = []
         self._theme = Gtk.IconTheme.get_default()
-        # Try to create our own watcher if none exists
-        try:
-            if dbus is not None:
-                sb = dbus.SessionBus()
-                self._own_watcher = SNIWatcher(sb)
-            else:
-                self._own_watcher = None
-        except Exception:
-            self._own_watcher = None
-        self._connect_watcher()
+        self._own_watcher = None
+        self._discovered_items = set()
+        self._host_name = "org.kde.StatusNotifierHost-%d" % os.getpid()
+
+        self._ensure_watcher()
+        self._ensure_appi_registrar()
+
+        self.bus.signal_subscribe(
+            "org.freedesktop.DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+            "/org/freedesktop/DBus",
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_name_owner_changed,
+        )
+
+        # Discover items that registered before us, without blocking startup.
+        GLib.idle_add(self._discover_existing_items)
         GLib.timeout_add_seconds(20, self._periodic)
+
+    def _on_name_owner_changed(self, conn, sender, path, iface, signal, params):
+        name, old_owner, new_owner = params.unpack()
+        if new_owner:
+            return
+        if self._own_watcher:
+            self._own_watcher.remove_owner(name)
+        removed = False
+        for ident, item in list(self._by_id.items()):
+            if item.bus_name == name:
+                del self._by_id[ident]
+                removed = True
+        if removed:
+            self._sync_items()
+            if self.on_change:
+                GLib.idle_add(self.on_change)
 
     def _periodic(self):
         self.refresh()
         return True
 
-    def _connect_watcher(self):
-        try:
-            self.watcher = Gio.DBusProxy.new_for_bus_sync(
-                Gio.BusType.SESSION,
-                Gio.DBusProxyFlags.NONE,
-                None,
-                self.WATCHER,
-                self.WATCHER_PATH,
-                self.WATCHER_IFACE,
-                None,
-            )
-            self.watcher.connect("g-signal", self._on_watcher_signal)
-            self._using_own_watcher = False
-            self.refresh()
-        except Exception:
-            self.watcher = None
-            if self._own_watcher:
-                self._using_own_watcher = True
-                self.refresh()
-            else:
-                GLib.timeout_add_seconds(5, self._retry)
+    def _ensure_watcher(self):
+        if self._service_exists(self.WATCHER):
+            try:
+                self.watcher = Gio.DBusProxy.new_for_bus_sync(
+                    Gio.BusType.SESSION,
+                    Gio.DBusProxyFlags.NONE,
+                    None,
+                    self.WATCHER,
+                    self.WATCHER_PATH,
+                    self.WATCHER_IFACE,
+                    None,
+                )
+                self.watcher.connect("g-signal", self._on_watcher_signal)
+                self._using_own_watcher = False
+                GLib.idle_add(self._register_host)
+                return
+            except Exception:
+                pass
 
-    def _retry(self):
-        if self.watcher is None:
-            self._connect_watcher()
+        if self._own_watcher is None:
+            try:
+                self._own_watcher = GioSNIWatcher(
+                    self.bus, self._on_item_registered
+                )
+                self._using_own_watcher = True
+            except Exception:
+                self._own_watcher = None
+
+        if not self._own_watcher:
+            GLib.timeout_add_seconds(5, self._retry_watcher)
+
+    def _register_host(self):
+        """Register this process as a StatusNotifierHost so apps expose items."""
+        try:
+            if self.watcher is not None:
+                self.watcher.call_sync(
+                    "RegisterStatusNotifierHost",
+                    GLib.Variant("(s)", (self._host_name,)),
+                    Gio.DBusCallFlags.NONE,
+                    1000,
+                    None,
+                )
+            elif self._own_watcher is not None:
+                if self._host_name not in self._own_watcher.hosts:
+                    self._own_watcher.hosts.append(self._host_name)
+        except Exception:
+            pass
         return False
 
-    def _use_own_watcher(self):
-        self._using_own_watcher = True
-        self.refresh()
+    def _ensure_appi_registrar(self):
+        if self._service_exists(self.APPI_REGISTRAR):
+            # Someone else owns the registrar; query it instead of owning it.
+            return
+        if dbus is None:
+            return
+        try:
+            sb = dbus.SessionBus()
+            self._appi_registrar = AppIndicatorRegistrar(sb)
+        except Exception:
+            self._appi_registrar = None
+
+    def _retry_watcher(self):
+        if self.watcher is None and self._own_watcher is None:
+            self._ensure_watcher()
+        return False
+
+    def _service_exists(self, name):
+        try:
+            reply = self.bus.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "ListNames",
+                None,
+                None,
+                Gio.DBusCallFlags.NONE,
+                500,
+                None,
+            )
+            names = reply.unpack()[0]
+            return name in names
+        except Exception:
+            return False
 
     def _on_watcher_signal(self, proxy, sender, signal_name, params):
         if signal_name in (
@@ -1114,77 +1446,247 @@ class TrayHost:
         ):
             self.refresh()
 
-    def _service_strings(self):
-        if self.watcher is None and not getattr(self, "_using_own_watcher", False):
-            return []
-        if getattr(self, "_using_own_watcher", False) and self._own_watcher:
-            return list(self._own_watcher._items)
-        try:
-            reply = self.bus.call_sync(
-                self.WATCHER,
-                self.WATCHER_PATH,
-                "org.freedesktop.DBus.Properties",
-                "Get",
-                GLib.Variant(
-                    "(ss)", (self.WATCHER_IFACE, "RegisteredStatusNotifierItems")
-                ),
-                None,
-                Gio.DBusCallFlags.NONE,
-                1000,
-                None,
-            )
-            return list(reply.unpack()[0])
-        except Exception:
-            prop = self.watcher.get_cached_property("RegisteredStatusNotifierItems")
-            return list(prop.unpack()) if prop else []
-
-    def refresh(self):
-        services = self._service_strings()
-        ids = []
-        for service in services:
-            if "/" in service:
-                name, rest = service.split("/", 1)
-                path = "/" + rest
-            else:
-                name, path = service, "/StatusNotifierItem"
-            ident = name + path
-            ids.append(ident)
-            if ident in self._by_id:
-                continue
-            try:
-                proxy = Gio.DBusProxy.new_for_bus_sync(
-                    Gio.BusType.SESSION,
-                    Gio.DBusProxyFlags.NONE,
-                    None,
-                    name,
-                    path,
-                    self.ITEM_IFACE,
-                    None,
-                )
-            except Exception:
-                continue
-            item = TrayItem(ident, name, path, proxy)
-            proxy.connect(
-                "g-properties-changed", lambda *a, it=item: self._update_item(it)
-            )
-            proxy.connect("g-signal", lambda *a, it=item: self._update_item(it))
-            self._by_id[ident] = item
-            self._update_item(item, notify=False)
-            self._prepare_menu(item)
-
-        for ident in list(self._by_id):
-            if ident not in ids:
-                del self._by_id[ident]
-
-        self.items = [self._by_id[i] for i in ids if i in self._by_id]
+    def _on_item_registered(self, name, path):
+        """Called by our own watcher the moment an app registers."""
+        self._register_item(name, path, self.KDE_ITEM_IFACE)
+        self._sync_items()
         if self.on_change:
             GLib.idle_add(self.on_change)
 
+    def _discover_existing_items(self):
+        """Probe the bus asynchronously for SNI items that did not register.
+
+        Uses Gio's async D-Bus calls so startup never blocks on apps that do
+        not answer. Apps that watch for the watcher register on their own; this
+        catches the ones that were started before us and only register once.
+        """
+        try:
+            reply = self.bus.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "ListNames",
+                None,
+                None,
+                Gio.DBusCallFlags.NONE,
+                500,
+                None,
+            )
+            names = list(reply.unpack()[0])
+        except Exception:
+            return False
+
+        skip_prefixes = (
+            "org.freedesktop.DBus",
+            "org.gtk.",
+            "org.kde.StatusNotifierHost",
+            "org.kde.StatusNotifierWatcher",
+            "org.mpris.",
+            "org.pulseaudio.",
+            "org.bluez.",
+            "org.gnome.",
+            "ca.desrt.",
+            "org.a11y.",
+            "org.lxde.",
+            "com.canonical.AppIndicator",
+        )
+        targets = ["/StatusNotifierItem", "/org/ayatana/StatusNotifierItem"]
+        for name in names:
+            if any(name.startswith(p) for p in skip_prefixes):
+                continue
+            if name == self._host_name:
+                continue
+            for path in targets:
+                ident = name + path
+                if ident in self._by_id or ident in self._discovered_items:
+                    continue
+                self._discovered_items.add(ident)
+                try:
+                    self.bus.call(
+                        name,
+                        path,
+                        "org.freedesktop.DBus.Properties",
+                        "Get",
+                        GLib.Variant("(ss)", (self.KDE_ITEM_IFACE, "Id")),
+                        None,
+                        Gio.DBusCallFlags.NONE,
+                        400,
+                        None,
+                        self._on_probe_reply,
+                        (name, path),
+                    )
+                except Exception:
+                    pass
+        return False
+
+    def _on_probe_reply(self, conn, result, data):
+        name, path = data
+        try:
+            conn.call_finish(result)
+        except Exception:
+            return
+        if name + path in self._by_id:
+            return
+        self._register_item(name, path, self.KDE_ITEM_IFACE)
+        self._sync_items()
+        if self.on_change:
+            GLib.idle_add(self.on_change)
+
+    def _register_item(self, name, path, iface):
+        ident = name + path
+        if ident in self._by_id or ident in self._pending:
+            return
+        self._pending.add(ident)
+        try:
+            Gio.DBusProxy.new(
+                self.bus,
+                Gio.DBusProxyFlags.NONE,
+                None,
+                name,
+                path,
+                iface,
+                None,
+                self._on_proxy_ready,
+                (ident, name, path, iface),
+            )
+        except Exception:
+            self._pending.discard(ident)
+
+    def _on_proxy_ready(self, source, result, data):
+        ident, name, path, iface = data
+        self._pending.discard(ident)
+        if ident in self._by_id:
+            return
+        try:
+            proxy = Gio.DBusProxy.new_finish(result)
+        except Exception:
+            return
+        item = TrayItem(ident, name, path, proxy)
+        item.iface = iface
+        proxy.connect("g-properties-changed", lambda *a, it=item: self._update_item(it))
+        proxy.connect("g-signal", lambda *a, it=item: self._update_item(it))
+        self._update_item(item, notify=False)
+        if not item.title and item.pixbuf is None and not item.menu_path:
+            # Stale/transient registration with no usable content.
+            return
+        self._by_id[ident] = item
+        self._prepare_menu(item)
+        self._sync_items()
+        if self.on_change:
+            GLib.idle_add(self.on_change)
+
+    def refresh(self):
+        for name, path, iface in self._get_registered_services():
+            self._register_item(name, path, iface)
+
+        # Drop items whose owning service has gone away.
+        for ident, item in list(self._by_id.items()):
+            if not self._name_has_owner(item.bus_name):
+                del self._by_id[ident]
+
+        self._sync_items()
+        if self.on_change:
+            GLib.idle_add(self.on_change)
+
+    def _sync_items(self):
+        self.items = list(self._by_id.values())
+
+    def _name_has_owner(self, name):
+        if not name:
+            return False
+        try:
+            reply = self.bus.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                GLib.Variant("(s)", (name,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                300,
+                None,
+            )
+            return bool(reply.unpack()[0])
+        except Exception:
+            return True
+
+    @staticmethod
+    def _split_registration(service):
+        service = str(service or "")
+        if "/" in service:
+            name, rest = service.split("/", 1)
+            return name, "/" + rest
+        return service, "/StatusNotifierItem"
+
+    def _get_registered_services(self):
+        services = []
+        seen = set()
+
+        def add(name, path):
+            if not name:
+                return
+            key = (name, path)
+            if key in seen:
+                return
+            seen.add(key)
+            services.append((name, path, self.KDE_ITEM_IFACE))
+
+        if self._own_watcher:
+            for name, path in self._own_watcher.items:
+                add(name, path)
+
+        if self.watcher:
+            try:
+                reply = self.bus.call_sync(
+                    self.WATCHER,
+                    self.WATCHER_PATH,
+                    "org.freedesktop.DBus.Properties",
+                    "Get",
+                    GLib.Variant("(ss)", (self.WATCHER_IFACE, "RegisteredStatusNotifierItems")),
+                    None,
+                    Gio.DBusCallFlags.NONE,
+                    1000,
+                    None,
+                )
+                for service in reply.unpack()[0]:
+                    name, path = self._split_registration(service)
+                    add(name, path)
+            except Exception:
+                pass
+
+        if self._appi_registrar:
+            for service in self._appi_registrar._apps:
+                name, path = self._split_registration(service)
+                add(name, path)
+        elif self._service_exists(self.APPI_REGISTRAR):
+            # Query the registrar owned by another process.
+            try:
+                reply = self.bus.call_sync(
+                    self.APPI_REGISTRAR,
+                    self.APPI_REGISTRAR_PATH,
+                    self.APPI_REGISTRAR_IFACE,
+                    "GetApplications",
+                    None,
+                    None,
+                    Gio.DBusCallFlags.NONE,
+                    1000,
+                    None,
+                )
+                for service in reply.unpack()[0]:
+                    name, path = self._split_registration(service)
+                    add(name, path)
+            except Exception:
+                pass
+
+        return services
+
     def _update_item(self, item, notify=True):
         try:
+            iface = getattr(item, "iface", self.KDE_ITEM_IFACE)
+            
             title = item.proxy.get_cached_property("Title")
-            ident = item.proxy.get_cached_property("Id")
-            raw = str((title or ident).unpack()) if (title or ident) else ""
+            ident_prop = item.proxy.get_cached_property("Id")
+            raw = str((title or ident_prop).unpack()) if (title or ident_prop) else ""
             item.title = self._pretty_title(raw)
 
             mpath = item.proxy.get_cached_property("Menu")
@@ -1195,9 +1697,9 @@ class TrayHost:
             if pix is not None:
                 pixbuf = self._pixbuf_from_pixmap(pix.unpack())
             if pixbuf is None:
-                name = item.proxy.get_cached_property("IconName")
-                if name is not None:
-                    pixbuf = self._pixbuf_from_name(str(name.unpack()))
+                name_prop = item.proxy.get_cached_property("IconName")
+                if name_prop is not None:
+                    pixbuf = self._pixbuf_from_name(str(name_prop.unpack()))
             item.pixbuf = pixbuf
         except Exception:
             pass
@@ -1317,6 +1819,7 @@ class TrayHost:
                 )
             except Exception:
                 pass
+
 
 
 # cairo helpers
