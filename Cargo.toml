@@ -1,0 +1,25 @@
+[package]
+name = "hyprisland"
+version = "0.1.0"
+edition = "2021"
+description = "A spring-animated Dynamic Island for Hyprland"
+license = "MPL-2.0"
+
+[dependencies]
+cairo-rs = "0.18"
+gdk = { version = "0.18", features = ["v3_24"] }
+gdk-pixbuf = "0.18"
+glib = "0.18"
+gtk = { version = "0.18", features = ["v3_24"] }
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+pango = "0.18"
+pangocairo = "0.18"
+rustfft = "6"
+serde_json = "1"
+ureq = "3"
+zbus = "5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
