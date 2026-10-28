@@ -1,6 +1,6 @@
 # Dynamic Island for Hyprland
 
-A lightweight, spring-animated Dynamic Island for Hyprland, rewritten in Rust.
+A lightweight, spring-animated Dynamic Island for Hyprland, written in Rust.
 
 Features a minimal floating pill with three interactive views: music playback, system information, and system tray. Supports smooth expand/collapse animations, gesture-based interaction, media controls, and volume adjustment - all rendered on a single transparent surface.
 
